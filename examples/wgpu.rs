@@ -1,15 +1,59 @@
+// Note: This example is incompatible with Linux since GTK4 does not support
+// embedding into raw X11 window handles. On Linux, use WebViewBuilderExtUnix::new_gtk()
+// with a GTK4 container instead. See examples/gtk4_simple.rs for the recommended approach.
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+fn main() {
+  eprintln!("This example is incompatible with Linux.");
+  eprintln!("GTK4 does not support embedding into raw X11 window handles.");
+  eprintln!("See examples/gtk4_simple.rs for the recommended approach on Linux.");
+}
+
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 use std::{borrow::Cow, sync::Arc};
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 use winit::{
   application::ApplicationHandler,
   event::WindowEvent,
   event_loop::{ActiveEventLoop, EventLoop},
   window::{Window, WindowId},
 };
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 use wry::{
   dpi::{LogicalPosition, LogicalSize},
   Rect, WebViewBuilder,
 };
 
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 #[derive(Default)]
 struct State {
   window: Option<Arc<Window>>,
@@ -17,6 +61,13 @@ struct State {
   gfx_state: Option<GfxState>,
 }
 
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 struct GfxState {
   surface: wgpu::Surface<'static>,
   device: wgpu::Device,
@@ -25,6 +76,13 @@ struct GfxState {
   render_pipeline: wgpu::RenderPipeline,
 }
 
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 impl GfxState {
   fn new(window: Arc<Window>) -> Self {
     let instance = wgpu::Instance::default();
@@ -157,6 +215,13 @@ impl GfxState {
   }
 }
 
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 impl ApplicationHandler for State {
   fn resumed(&mut self, event_loop: &ActiveEventLoop) {
     let mut attributes = Window::default_attributes();
@@ -229,44 +294,17 @@ impl ApplicationHandler for State {
     }
   }
 
-  fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-    #[cfg(any(
-      target_os = "linux",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "netbsd",
-      target_os = "openbsd",
-    ))]
-    {
-      while gtk::events_pending() {
-        gtk::main_iteration_do(false);
-      }
-    }
-  }
+  fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
 }
 
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+)))]
 fn main() {
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-  ))]
-  {
-    use gtk::prelude::DisplayExtManual;
-
-    gtk::init().unwrap();
-    if gtk::gdk::Display::default().unwrap().backend().is_wayland() {
-      panic!("This example doesn't support wayland!");
-    }
-
-    winit::platform::x11::register_xlib_error_hook(Box::new(|_display, error| {
-      let error = error as *mut x11_dl::xlib::XErrorEvent;
-      (unsafe { (*error).error_code }) == 170
-    }));
-  }
-
   let event_loop = EventLoop::new().unwrap();
   let mut state = State::default();
   event_loop.run_app(&mut state).unwrap();

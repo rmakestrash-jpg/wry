@@ -172,25 +172,25 @@ event_loop.run_app(&mut app).unwrap();
 ###### Arch Linux / Manjaro:
 
 ```bash
-sudo pacman -S webkit2gtk-4.1
+sudo pacman -S webkitgtk-6.0
 ```
 
 ###### Debian / Ubuntu:
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-dev
+sudo apt install libwebkitgtk-6.0-dev
 ```
 
 ###### Fedora
 
 ```bash
-sudo dnf install gtk3-devel webkit2gtk4.1-devel
+sudo dnf install gtk4-devel webkitgtk6.0-devel
 ```
 
 ###### Nix & NixOS
 
 ```sh
-nix-shell -p pkg-config webkitgtk_4_1
+nix-shell -p pkg-config webkitgtk_6_0
 ```
 
 ###### GUIX

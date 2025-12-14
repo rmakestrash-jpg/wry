@@ -51,26 +51,31 @@
 //! event_loop.run_app(&mut app).unwrap();
 //! ```
 //!
-//! If you also want to support Wayland too, then we recommend you use [`WebViewBuilderExtUnix::new_gtk`] on Linux.
-//! See the following example using [`tao`]:
+//! If you also want to support Wayland too, then we recommend you use [`WebViewBuilderExtUnix::new_gtk`] on Linux
+//! with a pure GTK4 application. See `examples/gtk4_simple.rs` for a complete example.
 //!
 //! ```no_run
 //! # use wry::WebViewBuilder;
-//! # use tao::{window::WindowBuilder, event_loop::EventLoop};
-//! # #[cfg(target_os = "linux")]
-//! # use tao::platform::unix::WindowExtUnix;
 //! # #[cfg(target_os = "linux")]
 //! # use wry::WebViewBuilderExtUnix;
-//! let event_loop = EventLoop::new();
-//! let window = WindowBuilder::new().build(&event_loop).unwrap();
-//!
+//! # #[cfg(target_os = "linux")]
+//! # fn main() -> wry::Result<()> {
+//! # use gtk4::prelude::*;
+//! # gtk4::init().unwrap();
+//! # let window = gtk4::Window::new();
+//! # let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+//! # window.set_child(Some(&vbox));
 //! let builder = WebViewBuilder::new().with_url("https://tauri.app");
-//!
-//! #[cfg(not(target_os = "linux"))]
-//! let webview = builder.build(&window).unwrap();
-//! #[cfg(target_os = "linux")]
-//! let webview = builder.build_gtk(window.gtk_window()).unwrap();
+//! let webview = builder.build_gtk(&vbox)?;
+//! # window.present();
+//! # Ok(())
+//! # }
+//! # #[cfg(not(target_os = "linux"))]
+//! # fn main() {}
 //! ```
+//!
+//! > **Note**: On Linux, wry uses GTK4 and webkit6. Window libraries like `tao` and `winit` that use
+//! > raw X11 handles or GTK3 are not compatible. Use pure GTK4 with [`WebViewBuilderExtUnix::new_gtk`].
 //!
 //! ## Child webviews
 //!
@@ -110,37 +115,32 @@
 //! event_loop.run_app(&mut app).unwrap();
 //! ```
 //!
-//! If you want to support X11 and Wayland at the same time, we recommend using
-//! [`WebViewExtUnix::new_gtk`] or [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+//! If you want to support X11 and Wayland at the same time on Linux, we recommend using
+//! [`WebViewBuilderExtUnix::new_gtk`] with [`gtk4::Fixed`] for positioned child webviews.
 //!
 //! ```no_run
-//! # use wry::{WebViewBuilder, raw_window_handle, Rect, dpi::*};
-//! # use tao::{window::WindowBuilder, event_loop::EventLoop};
 //! # #[cfg(target_os = "linux")]
+//! # fn main() -> wry::Result<()> {
+//! # use wry::{WebViewBuilder, Rect, dpi::*};
 //! # use wry::WebViewBuilderExtUnix;
-//! # #[cfg(target_os = "linux")]
-//! # use tao::platform::unix::WindowExtUnix;
-//! let event_loop = EventLoop::new();
-//! let window = WindowBuilder::new().build(&event_loop).unwrap();
+//! # use gtk4::prelude::*;
+//! # gtk4::init().unwrap();
+//! # let window = gtk4::Window::new();
+//! let fixed = gtk4::Fixed::new();
+//! window.set_child(Some(&fixed));
 //!
-//! let builder = WebViewBuilder::new()
+//! let webview = WebViewBuilder::new()
 //!   .with_url("https://tauri.app")
 //!   .with_bounds(Rect {
 //!     position: LogicalPosition::new(100, 100).into(),
 //!     size: LogicalSize::new(200, 200).into(),
-//!   });
-//!
-//! #[cfg(not(target_os = "linux"))]
-//! let webview = builder.build_as_child(&window).unwrap();
-//! #[cfg(target_os = "linux")]
-//! let webview = {
-//!   # use gtk::prelude::*;
-//!   let vbox = window.default_vbox().unwrap(); // tao adds a gtk::Box by default
-//!   let fixed = gtk::Fixed::new();
-//!   fixed.show_all();
-//!   vbox.pack_start(&fixed, true, true, 0);
-//!   builder.build_gtk(&fixed).unwrap()
-//! };
+//!   })
+//!   .build_gtk(&fixed)?;
+//! # window.present();
+//! # Ok(())
+//! # }
+//! # #[cfg(not(target_os = "linux"))]
+//! # fn main() {}
 //! ```
 //!
 //! ## Platform Considerations
@@ -151,8 +151,8 @@
 //!
 //! [WebKitGTK](https://webkitgtk.org/) is used to provide webviews on Linux which requires GTK,
 //! so if the windowing library doesn't support GTK (as in [`winit`])
-//! you'll need to call [`gtk::init`] before creating the webview and then call [`gtk::main_iteration_do`] alongside
-//! your windowing library event loop.
+//! you'll need to call [`gtk4::init`] before creating the webview and then advance the GTK main context alongside
+//! your windowing library event loop using `glib::MainContext::default().iteration(false)`.
 //!
 //! ```no_run
 //! # use wry::{WebView, WebViewBuilder};
@@ -178,8 +178,9 @@
 //!   // Advance GTK event loop <!----- IMPORTANT
 //!   fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
 //!     #[cfg(target_os = "linux")]
-//!     while gtk::events_pending() {
-//!       gtk::main_iteration_do(false);
+//!     {
+//!       use gtk4::glib;
+//!       while glib::MainContext::default().iteration(false) {}
 //!     }
 //!   }
 //! }
@@ -194,19 +195,19 @@
 //! ##### Arch Linux / Manjaro:
 //!
 //! ```bash
-//! sudo pacman -S webkit2gtk-4.1
+//! sudo pacman -S webkitgtk-6.0
 //! ```
 //!
 //! ##### Debian / Ubuntu:
 //!
 //! ```bash
-//! sudo apt install libwebkit2gtk-4.1-dev
+//! sudo apt install libwebkitgtk-6.0-dev
 //! ```
 //!
 //! ##### Fedora
 //!
 //! ```bash
-//! sudo dnf install gtk3-devel webkit2gtk4.1-devel
+//! sudo dnf install gtk4-devel webkitgtk6.0-devel
 //! ```
 //!
 //! ##### Nix & NixOS
@@ -219,7 +220,7 @@
 //!    pkgs = import (fetchTarball("channel:nixpkgs-unstable")) { };
 //!    packages = with pkgs; [
 //!      pkg-config
-//!      webkitgtk_4_1
+//!      webkitgtk_6_0
 //!    ];
 //!  in
 //!  pkgs.mkShell {
@@ -474,7 +475,7 @@ pub enum NewWindowResponse {
       target_os = "netbsd",
       target_os = "openbsd",
     ))]
-    webview: webkit2gtk::WebView,
+    webview: webkit6::WebView,
     #[cfg(windows)]
     webview: ICoreWebView2,
     #[cfg(target_os = "macos")]
@@ -497,7 +498,7 @@ pub struct NewWindowOpener {
     target_os = "netbsd",
     target_os = "openbsd",
   ))]
-  pub webview: webkit2gtk::WebView,
+  pub webview: webkit6::WebView,
   /// The instance of the webview that initiated the new window request.
   #[cfg(windows)]
   pub webview: ICoreWebView2,
@@ -772,7 +773,7 @@ pub struct WebViewAttributes<'a> {
 
   /// The webview bounds. Defaults to `x: 0, y: 0, width: 200, height: 200`.
   /// This is only effective if the webview was created by [`WebView::new_as_child`] or [`WebViewBuilder::new_as_child`]
-  /// or on Linux, if was created by [`WebViewExtUnix::new_gtk`] or [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  /// or on Linux, if was created by [`WebViewExtUnix::new_gtk`] or [`WebViewBuilderExtUnix::new_gtk`] with [`gtk4::Fixed`].
   pub bounds: Option<Rect>,
 
   /// Whether background throttling should be disabled.
@@ -1373,7 +1374,7 @@ impl<'a> WebViewBuilder<'a> {
   }
 
   /// Specify the webview position relative to its parent if it will be created as a child
-  /// or if created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  /// or if created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk4::Fixed`].
   ///
   /// Defaults to `x: 0, y: 0, width: 200, height: 200`.
   pub fn with_bounds(mut self, bounds: Rect) -> Self {
@@ -1411,8 +1412,8 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **Linux**: Only X11 is supported, if you want to support Wayland too, use [`WebViewBuilderExtUnix::new_gtk`].
   ///
-  ///   Although this methods only needs an X11 window handle, we use webkit2gtk, so you still need to initialize gtk
-  ///   by callling [`gtk::init`] and advance its loop alongside your event loop using [`gtk::main_iteration_do`].
+  ///   Although this methods only needs an X11 window handle, we use webkitgtk, so you still need to initialize gtk
+  ///   by callling [`gtk4::init`] and advance its loop alongside your event loop using `glib::MainContext::default().iteration(false)`.
   ///   Checkout the [Platform Considerations](https://docs.rs/wry/latest/wry/#platform-considerations) section in the crate root documentation.
   /// - **Windows**: The webview will auto-resize when the passed handle is resized.
   /// - **Linux (X11)**: Unlike macOS and Windows, the webview will not auto-resize and you'll need to call [`WebView::set_bounds`] manually.
@@ -1420,7 +1421,7 @@ impl<'a> WebViewBuilder<'a> {
   /// # Panics:
   ///
   /// - Panics if the provided handle was not supported or invalid.
-  /// - Panics on Linux, if [`gtk::init`] was not called in this thread.
+  /// - Panics on Linux, if [`gtk4::init`] was not called in this thread.
   pub fn build<W: HasWindowHandle>(self, window: &'a W) -> Result<WebView> {
     self.error?;
 
@@ -1437,18 +1438,18 @@ impl<'a> WebViewBuilder<'a> {
   /// - **Linux**: This will create the webview as a child window of the `parent` window. Only X11
   ///   is supported. This method won't work on Wayland.
   ///
-  ///   Although this methods only needs an X11 window handle, you use webkit2gtk, so you still need to initialize gtk
-  ///   by callling [`gtk::init`] and advance its loop alongside your event loop using [`gtk::main_iteration_do`].
+  ///   Although this methods only needs an X11 window handle, you use webkitgtk, so you still need to initialize gtk
+  ///   by callling [`gtk4::init`] and advance its loop alongside your event loop using `glib::MainContext::default().iteration(false)`.
   ///   Checkout the [Platform Considerations](https://docs.rs/wry/latest/wry/#platform-considerations) section in the crate root documentation.
   ///
   ///   If you want to support child webviews on X11 and Wayland at the same time,
-  ///   we recommend using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  ///   we recommend using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk4::Fixed`].
   /// - **Android/iOS:** Unsupported.
   ///
   /// # Panics:
   ///
   /// - Panics if the provided handle was not support or invalid.
-  /// - Panics on Linux, if [`gtk::init`] was not called in this thread.
+  /// - Panics on Linux, if [`gtk4::init`] was not called in this thread.
   pub fn build_as_child<W: HasWindowHandle>(self, window: &'a W) -> Result<WebView> {
     self.error?;
 
@@ -1860,7 +1861,7 @@ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
 #[derive(Default)]
 pub(crate) struct PlatformSpecificWebViewAttributes {
   extension_path: Option<PathBuf>,
-  related_view: Option<webkit2gtk::WebView>,
+  related_view: Option<webkit6::WebView>,
 }
 
 #[cfg(any(
@@ -1871,26 +1872,26 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   target_os = "openbsd",
 ))]
 pub trait WebViewBuilderExtUnix<'a> {
-  /// Consume the builder and create the webview inside a GTK container widget, such as GTK window.
+  /// Consume the builder and create the webview inside a GTK widget, such as GTK window.
   ///
-  /// - If the container is [`gtk::Box`], it is added using [`Box::pack_start(webview, true, true, 0)`](gtk::prelude::BoxExt::pack_start).
-  /// - If the container is [`gtk::Fixed`], its [size request](gtk::prelude::WidgetExt::set_size_request) will be set using the (width, height) bounds passed in
-  ///   and will be added to the container using [`Fixed::put`](gtk::prelude::FixedExt::put) using the (x, y) bounds passed in.
-  /// - For all other containers, it will be added using [`gtk::prelude::ContainerExt::add`]
+  /// - If the widget is [`gtk4::Box`], the webview is added using [`Box::append`](gtk4::prelude::BoxExt::append).
+  /// - If the widget is [`gtk4::Fixed`], its [size request](gtk4::prelude::WidgetExt::set_size_request) will be set using the (width, height) bounds passed in
+  ///   and will be added using [`Fixed::put`](gtk4::prelude::FixedExt::put) using the (x, y) bounds passed in.
+  /// - For other widget types, it will attempt to use type-specific child addition methods.
   ///
   /// # Panics:
   ///
-  /// - Panics if [`gtk::init`] was not called in this thread.
+  /// - Panics if [`gtk4::init`] was not called in this thread.
   fn build_gtk<W>(self, widget: &'a W) -> Result<WebView>
   where
-    W: gtk::prelude::IsA<gtk::Container>;
+    W: gtk4::prelude::IsA<gtk4::Widget>;
 
   /// Set the path from which to load extensions from.
   fn with_extensions_path(self, path: impl Into<PathBuf>) -> Self;
 
   /// Creates a new webview sharing the same web process with the provided webview.
   /// Useful if you need to link a webview to another, for instance when using the [`WebViewBuilder::with_new_window_req_handler`].
-  fn with_related_view(self, webview: webkit2gtk::WebView) -> Self;
+  fn with_related_view(self, webview: webkit6::WebView) -> Self;
 }
 
 #[cfg(any(
@@ -1903,7 +1904,7 @@ pub trait WebViewBuilderExtUnix<'a> {
 impl<'a> WebViewBuilderExtUnix<'a> for WebViewBuilder<'a> {
   fn build_gtk<W>(self, widget: &'a W) -> Result<WebView>
   where
-    W: gtk::prelude::IsA<gtk::Container>,
+    W: gtk4::prelude::IsA<gtk4::Widget>,
   {
     self.error?;
 
@@ -1916,7 +1917,7 @@ impl<'a> WebViewBuilderExtUnix<'a> for WebViewBuilder<'a> {
     self
   }
 
-  fn with_related_view(mut self, webview: webkit2gtk::WebView) -> Self {
+  fn with_related_view(mut self, webview: webkit6::WebView) -> Self {
     self.platform_specific.related_view.replace(webview);
     self
   }
@@ -1941,8 +1942,8 @@ impl WebView {
   ///
   /// - **Linux**: Only X11 is supported, if you want to support Wayland too, use [`WebViewExtUnix::new_gtk`].
   ///
-  ///   Although this methods only needs an X11 window handle, you use webkit2gtk, so you still need to initialize gtk
-  ///   by callling [`gtk::init`] and advance its loop alongside your event loop using [`gtk::main_iteration_do`].
+  ///   Although this methods only needs an X11 window handle, you use webkitgtk, so you still need to initialize gtk
+  ///   by callling [`gtk4::init`] and advance its loop alongside your event loop using `glib::MainContext::default().iteration(false)`.
   ///   Checkout the [Platform Considerations](https://docs.rs/wry/latest/wry/#platform-considerations) section in the crate root documentation.
   /// - **macOS / Windows**: The webview will auto-resize when the passed handle is resized.
   /// - **Linux (X11)**: Unlike macOS and Windows, the webview will not auto-resize and you'll need to call [`WebView::set_bounds`] manually.
@@ -1950,7 +1951,7 @@ impl WebView {
   /// # Panics:
   ///
   /// - Panics if the provided handle was not supported or invalid.
-  /// - Panics on Linux, if [`gtk::init`] was not called in this thread.
+  /// - Panics on Linux, if [`gtk4::init`] was not called in this thread.
   pub fn new(window: &impl HasWindowHandle, attrs: WebViewAttributes) -> Result<Self> {
     WebViewBuilder::new_with_attributes(attrs).build(window)
   }
@@ -1965,18 +1966,18 @@ impl WebView {
   /// - **Linux**: This will create the webview as a child window of the `parent` window. Only X11
   ///   is supported. This method won't work on Wayland.
   ///
-  ///   Although this methods only needs an X11 window handle, you use webkit2gtk, so you still need to initialize gtk
-  ///   by callling [`gtk::init`] and advance its loop alongside your event loop using [`gtk::main_iteration_do`].
+  ///   Although this methods only needs an X11 window handle, you use webkitgtk, so you still need to initialize gtk
+  ///   by callling [`gtk4::init`] and advance its loop alongside your event loop using `glib::MainContext::default().iteration(false)`.
   ///   Checkout the [Platform Considerations](https://docs.rs/wry/latest/wry/#platform-considerations) section in the crate root documentation.
   ///
   ///   If you want to support child webviews on X11 and Wayland at the same time,
-  ///   we recommend using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  ///   we recommend using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk4::Fixed`].
   /// - **Android/iOS:** Unsupported.
   ///
   /// # Panics:
   ///
   /// - Panics if the provided handle was not support or invalid.
-  /// - Panics on Linux, if [`gtk::init`] was not called in this thread.
+  /// - Panics on Linux, if [`gtk4::init`] was not called in this thread.
   pub fn new_as_child(parent: &impl HasWindowHandle, attrs: WebViewAttributes) -> Result<Self> {
     WebViewBuilder::new_with_attributes(attrs).build_as_child(parent)
   }
@@ -2136,7 +2137,7 @@ impl WebView {
   /// Set the webview bounds.
   ///
   /// This is only effective if the webview was created as a child
-  /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk4::Fixed`].
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
   }
@@ -2278,45 +2279,45 @@ impl WebViewExtWindows for WebView {
 /// Additional methods on `WebView` that are specific to Linux.
 #[cfg(gtk)]
 pub trait WebViewExtUnix: Sized {
-  /// Create the webview inside a GTK container widget, such as GTK window.
+  /// Create the webview inside a GTK widget, such as GTK window.
   ///
-  /// - If the container is [`gtk::Box`], it is added using [`Box::pack_start(webview, true, true, 0)`](gtk::prelude::BoxExt::pack_start).
-  /// - If the container is [`gtk::Fixed`], its [size request](gtk::prelude::WidgetExt::set_size_request) will be set using the (width, height) bounds passed in
-  ///   and will be added to the container using [`Fixed::put`](gtk::prelude::FixedExt::put) using the (x, y) bounds passed in.
-  /// - For all other containers, it will be added using [`gtk::prelude::ContainerExt::add`]
+  /// - If the widget is [`gtk4::Box`], the webview is added using [`Box::append`](gtk4::prelude::BoxExt::append).
+  /// - If the widget is [`gtk4::Fixed`], its [size request](gtk4::prelude::WidgetExt::set_size_request) will be set using the (width, height) bounds passed in
+  ///   and will be added using [`Fixed::put`](gtk4::prelude::FixedExt::put) using the (x, y) bounds passed in.
+  /// - For other widget types, it will attempt to use type-specific child addition methods.
   ///
   /// # Panics:
   ///
-  /// - Panics if [`gtk::init`] was not called in this thread.
+  /// - Panics if [`gtk4::init`] was not called in this thread.
   fn new_gtk<W>(widget: &W) -> Result<Self>
   where
-    W: gtk::prelude::IsA<gtk::Container>;
+    W: gtk4::prelude::IsA<gtk4::Widget>;
 
-  /// Returns Webkit2gtk Webview handle
-  fn webview(&self) -> webkit2gtk::WebView;
+  /// Returns webkit6 WebView handle
+  fn webview(&self) -> webkit6::WebView;
 
   /// Attaches this webview to the given Widget and removes it from the current one.
   fn reparent<W>(&self, widget: &W) -> Result<()>
   where
-    W: gtk::prelude::IsA<gtk::Container>;
+    W: gtk4::prelude::IsA<gtk4::Widget>;
 }
 
 #[cfg(gtk)]
 impl WebViewExtUnix for WebView {
   fn new_gtk<W>(widget: &W) -> Result<Self>
   where
-    W: gtk::prelude::IsA<gtk::Container>,
+    W: gtk4::prelude::IsA<gtk4::Widget>,
   {
     WebViewBuilder::new().build_gtk(widget)
   }
 
-  fn webview(&self) -> webkit2gtk::WebView {
+  fn webview(&self) -> webkit6::WebView {
     self.webview.webview.clone()
   }
 
   fn reparent<W>(&self, widget: &W) -> Result<()>
   where
-    W: gtk::prelude::IsA<gtk::Container>,
+    W: gtk4::prelude::IsA<gtk4::Widget>,
   {
     self.webview.reparent(widget)
   }

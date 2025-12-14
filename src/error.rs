@@ -7,10 +7,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
   #[cfg(gtk)]
   #[error(transparent)]
-  GlibError(#[from] gtk::glib::Error),
+  GlibError(#[from] gtk4::glib::Error),
   #[cfg(gtk)]
   #[error(transparent)]
-  GlibBoolError(#[from] gtk::glib::BoolError),
+  GlibBoolError(#[from] gtk4::glib::BoolError),
   #[cfg(gtk)]
   #[error("Fail to fetch security manager")]
   MissingManager,
@@ -20,6 +20,9 @@ pub enum Error {
   #[cfg(all(gtk, feature = "x11"))]
   #[error(transparent)]
   XlibError(#[from] x11_dl::error::OpenError),
+  #[cfg(all(gtk, feature = "x11"))]
+  #[error("GTK4 does not support embedding into raw X11 window handles. Use WebViewBuilderExtUnix::new_gtk() with a GTK container instead.")]
+  Gtk4X11EmbeddingUnsupported,
   #[error("Failed to initialize the script")]
   InitScriptError,
   #[error("Bad RPC request: {0} ((1))")]

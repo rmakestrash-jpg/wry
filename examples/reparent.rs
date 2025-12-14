@@ -14,23 +14,13 @@ use wry::WebViewBuilder;
 use {objc2_app_kit::NSWindow, tao::platform::macos::WindowExtMacOS, wry::WebViewExtMacOS};
 #[cfg(target_os = "windows")]
 use {tao::platform::windows::WindowExtWindows, wry::WebViewExtWindows};
-
 #[cfg(not(any(
   target_os = "windows",
   target_os = "macos",
   target_os = "ios",
   target_os = "android"
 )))]
-#[cfg(not(any(
-  target_os = "windows",
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "android"
-)))]
-use {
-  tao::platform::unix::WindowExtUnix,
-  wry::{WebViewBuilderExtUnix, WebViewExtUnix},
-};
+use {tao::platform::unix::WindowExtUnix, wry::WebViewExtUnix};
 
 fn main() -> wry::Result<()> {
   let event_loop = EventLoop::new();
@@ -54,6 +44,7 @@ fn main() -> wry::Result<()> {
   )))]
   let webview = {
     use tao::platform::unix::WindowExtUnix;
+    use wry::WebViewBuilderExtUnix;
     let vbox = window.default_vbox().unwrap();
     builder.build_gtk(vbox)?
   };

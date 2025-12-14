@@ -8,8 +8,14 @@ use std::{
   rc::Rc,
 };
 
-use gtk::{glib::GString, prelude::*};
-use webkit2gtk::WebView;
+use gtk4::{
+  gdk::{ContentFormats, DragAction, FileList},
+  gio,
+  glib,
+  prelude::*,
+  DropTargetAsync,
+};
+use webkit6::WebView;
 
 use crate::DragDropEvent;
 
@@ -73,69 +79,126 @@ impl DragDropController {
 pub(crate) fn connect_drag_event(webview: &WebView, handler: Box<dyn Fn(DragDropEvent) -> bool>) {
   let controller = Rc::new(DragDropController::new(handler));
 
+  // GTK4: Use DropTargetAsync which provides Drop object directly in signals
+  // FileList (requires v4_6) allows multiple files to be dropped at once
+  let formats = ContentFormats::for_type(FileList::static_type());
+  let drop_target = DropTargetAsync::new(Some(formats), DragAction::COPY);
+
+  // Handle drag enter - Drop object is provided directly
   {
     let controller = controller.clone();
-    webview.connect_drag_data_received(move |_, _, _, _, data, info, _| {
-      if info == 2 {
-        let uris = data.uris();
-        let paths = uris.iter().map(path_buf_from_uri).collect::<Vec<_>>();
-        controller.enter();
-        controller.call(DragDropEvent::Enter {
-          paths: paths.clone(),
-          position: controller.position.get(),
-        });
-        controller.store_paths(paths);
-      }
-    });
-  }
+    drop_target.connect_drag_enter(move |_target, drop, x, y| {
+      controller.store_position((x as i32, y as i32));
 
-  {
-    let controller = controller.clone();
-    webview.connect_drag_motion(move |_, _, x, y, _| {
-      if controller.state() == DragControllerState::Entered {
-        controller.call(DragDropEvent::Over { position: (x, y) });
-      } else {
-        controller.store_position((x, y));
-      }
-      false
-    });
-  }
-
-  {
-    let controller = controller.clone();
-    webview.connect_drag_drop(move |_, ctx, x, y, time| {
-      if controller.state() == DragControllerState::Leaving {
-        if let Some(paths) = controller.take_paths() {
-          ctx.drop_finish(true, time);
-          controller.leave();
-          return controller.call(DragDropEvent::Drop {
-            paths,
-            position: (x, y),
-          });
-        }
-      }
-
-      false
-    });
-  }
-
-  webview.connect_drag_leave(move |_w, _, _| {
-    if controller.state() != DragControllerState::Left {
-      controller.leaving();
+      // Read files asynchronously from the Drop object
       let controller = controller.clone();
-      gtk::glib::idle_add_local_once(move || {
-        if controller.state() == DragControllerState::Leaving {
-          controller.leave();
-          controller.call(DragDropEvent::Leave);
-        }
-      });
-    }
-  });
+      drop.read_value_async(
+        FileList::static_type(),
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |result| {
+          if let Ok(value) = result {
+            if let Ok(file_list) = value.get::<FileList>() {
+              let paths: Vec<PathBuf> = file_list.files().iter().map(path_buf_from_file).collect();
+              if !paths.is_empty() {
+                controller.enter();
+                controller.call(DragDropEvent::Enter {
+                  paths: paths.clone(),
+                  position: controller.position.get(),
+                });
+                controller.store_paths(paths);
+              }
+            }
+          }
+        },
+      );
+
+      DragAction::COPY
+    });
+  }
+
+  // Handle drag motion (hover)
+  {
+    let controller = controller.clone();
+    drop_target.connect_drag_motion(move |_target, _drop, x, y| {
+      if controller.state() == DragControllerState::Entered {
+        controller.call(DragDropEvent::Over {
+          position: (x as i32, y as i32),
+        });
+      } else {
+        controller.store_position((x as i32, y as i32));
+      }
+      DragAction::COPY
+    });
+  }
+
+  // Handle drop
+  {
+    let controller = controller.clone();
+    drop_target.connect_drop(move |_target, drop, x, y| {
+      let controller = controller.clone();
+      let position = (x as i32, y as i32);
+
+      // Read the files from the drop
+      drop.read_value_async(
+        FileList::static_type(),
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |result| {
+          if let Ok(value) = result {
+            if let Ok(file_list) = value.get::<FileList>() {
+              let paths: Vec<PathBuf> = file_list.files().iter().map(path_buf_from_file).collect();
+              if !paths.is_empty() {
+                controller.leave();
+                controller.call(DragDropEvent::Drop { paths, position });
+                return;
+              }
+            }
+          }
+
+          // Fall back to stored paths if async read failed
+          if let Some(paths) = controller.take_paths() {
+            controller.leave();
+            controller.call(DragDropEvent::Drop { paths, position });
+          }
+        },
+      );
+
+      true // Accept the drop
+    });
+  }
+
+  // Handle drag leave
+  {
+    drop_target.connect_drag_leave(move |_target, _drop| {
+      if controller.state() != DragControllerState::Left {
+        controller.leaving();
+        let controller = controller.clone();
+        glib::idle_add_local_once(move || {
+          if controller.state() == DragControllerState::Leaving {
+            controller.leave();
+            controller.call(DragDropEvent::Leave);
+          }
+        });
+      }
+    });
+  }
+
+  webview.add_controller(drop_target);
 }
 
-fn path_buf_from_uri(gstr: &GString) -> PathBuf {
-  let path = gstr.as_str();
-  let path = path.strip_prefix("file://").unwrap_or(path);
+fn path_buf_from_file(file: &gio::File) -> PathBuf {
+  if let Some(path) = file.path() {
+    path
+  } else {
+    // uri() returns GString directly in gio 0.21+
+    let uri = file.uri();
+    path_buf_from_uri(uri.as_str())
+  }
+}
+
+fn path_buf_from_uri(uri: &str) -> PathBuf {
+  let path = uri.strip_prefix("file://").unwrap_or(uri);
   let path = percent_encoding::percent_decode(path.as_bytes())
     .decode_utf8_lossy()
     .to_string();

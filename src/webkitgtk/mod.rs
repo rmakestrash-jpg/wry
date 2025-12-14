@@ -2,29 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-#[cfg(feature = "x11")]
-use dpi::LogicalPosition;
 use dpi::LogicalSize;
-use ffi::CookieManageExt;
-#[cfg(feature = "x11")]
-use gdkx11::{
-  ffi::{gdk_x11_window_foreign_new_for_display, GdkX11Display},
-  X11Display,
-};
-#[cfg(feature = "x11")]
-use gtk::glib::{self, translate::FromGlibPtrFull};
-use gtk::{
+use gtk4::{
   gdk::{self},
   gio::Cancellable,
+  glib,
   prelude::*,
 };
 use http::Request;
-use javascriptcore::ValueExt;
 use raw_window_handle::HasWindowHandle;
-#[cfg(feature = "x11")]
-use raw_window_handle::RawWindowHandle;
-#[cfg(feature = "x11")]
-use std::ffi::c_ulong;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -32,22 +18,18 @@ use std::{
   rc::Rc,
   sync::{Arc, Mutex},
 };
-#[cfg(any(debug_assertions, feature = "devtools"))]
-use webkit2gtk::WebInspectorExt;
-use webkit2gtk::{
-  AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationPolicyDecision,
-  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PolicyDecisionType,
-  PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
-  UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime,
-  WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
-  WebsiteDataManagerExtManual, WebsitePolicies,
+use webkit6::prelude::*;
+use webkit6::{
+  AutoplayPolicy, LoadEvent, NavigationAction, NavigationPolicyDecision,
+  NetworkProxyMode, NetworkProxySettings, PolicyDecisionType,
+  URIRequest, UserContentInjectedFrames,
+  UserContentManager, UserScript, UserScriptInjectionTime,
+  WebView, WebsitePolicies,
 };
-use webkit2gtk_sys::{
+use webkit6::ffi::{
   webkit_get_major_version, webkit_get_micro_version, webkit_get_minor_version,
   webkit_policy_decision_ignore, webkit_policy_decision_use,
 };
-#[cfg(feature = "x11")]
-use x11_dl::xlib::*;
 
 pub use web_context::WebContextImpl;
 
@@ -60,26 +42,55 @@ use self::web_context::WebContextExt;
 
 const WEBVIEW_ID: &str = "webview_id";
 
+/// Connect to the WebView "create" signal with proper Option<Widget> support.
+///
+/// The webkit6-rs bindings incorrectly require a non-optional Widget return type,
+/// but the C API allows returning NULL to deny popup creation. This function
+/// provides the correct behavior by using raw signal connection.
+///
+/// See: https://webkitgtk.org/reference/webkit2gtk/stable/signal.WebView.create.html
+fn connect_create_with_nullable_return<F>(webview: &WebView, f: F) -> gtk4::glib::SignalHandlerId
+where
+  F: Fn(&WebView, &mut NavigationAction) -> Option<gtk4::Widget> + 'static,
+{
+  use gtk4::glib::{
+    signal::connect_raw,
+    translate::{from_glib_borrow, from_glib_none, ToGlibPtr},
+  };
+
+  unsafe extern "C" fn create_trampoline<
+    F: Fn(&WebView, &mut NavigationAction) -> Option<gtk4::Widget> + 'static,
+  >(
+    this: *mut webkit6::ffi::WebKitWebView,
+    navigation_action: *mut webkit6::ffi::WebKitNavigationAction,
+    f: gtk4::glib::ffi::gpointer,
+  ) -> *mut gtk4::ffi::GtkWidget {
+    let f: &F = &*(f as *const F);
+    // webkit6 NavigationAction methods like request() require &mut self
+    // Use from_glib_none to get an owned copy we can mutate
+    let mut action: NavigationAction = from_glib_none(navigation_action);
+    match f(&from_glib_borrow(this), &mut action) {
+      Some(widget) => widget.to_glib_full(),
+      None => std::ptr::null_mut(),
+    }
+  }
+
+  unsafe {
+    let f: Box<F> = Box::new(f);
+    connect_raw(
+      webview.as_ptr() as *mut _,
+      c"create".as_ptr() as *const _,
+      Some(std::mem::transmute::<*const (), unsafe extern "C" fn()>(
+        create_trampoline::<F> as *const (),
+      )),
+      Box::into_raw(f),
+    )
+  }
+}
+
 mod drag_drop;
 mod synthetic_mouse_events;
 mod web_context;
-
-#[cfg(feature = "x11")]
-struct X11Data {
-  is_child: bool,
-  xlib: Xlib,
-  x11_display: *mut std::ffi::c_void,
-  x11_window: c_ulong,
-  gtk_window: gtk::Window,
-}
-
-#[cfg(feature = "x11")]
-impl Drop for X11Data {
-  fn drop(&mut self) {
-    unsafe { (self.xlib.XDestroyWindow)(self.x11_display as _, self.x11_window) };
-    self.gtk_window.close();
-  }
-}
 
 pub(crate) struct InnerWebView {
   id: String,
@@ -88,158 +99,53 @@ pub(crate) struct InnerWebView {
   is_inspector_open: Arc<AtomicBool>,
   pending_scripts: Arc<Mutex<Option<Vec<String>>>>,
   is_in_fixed_parent: bool,
-
-  #[cfg(feature = "x11")]
-  x11: Option<X11Data>,
 }
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
-    unsafe { self.webview.destroy() }
+    // GTK4: Use unparent() instead of destroy()
+    // The widget will be cleaned up when all references are dropped
+    self.webview.unparent();
   }
 }
 
 impl InnerWebView {
+  /// Create a new webview from a raw window handle.
+  ///
+  /// **Note:** GTK4 does not support embedding into raw X11 window handles.
+  /// Use [`new_gtk`](Self::new_gtk) with a GTK container instead.
   pub fn new<W: HasWindowHandle>(
-    window: &W,
-    attributes: WebViewAttributes,
-    pl_attrs: super::PlatformSpecificWebViewAttributes,
+    _window: &W,
+    _attributes: WebViewAttributes,
+    _pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self> {
     #[cfg(feature = "x11")]
     {
-      Self::new_x11(window, attributes, pl_attrs, false)
+      Err(Error::Gtk4X11EmbeddingUnsupported)
     }
     #[cfg(not(feature = "x11"))]
     {
-      let _ = window;
-      let _ = attributes;
-      let _ = pl_attrs;
       Err(Error::UnsupportedWindowHandle)
     }
   }
 
+  /// Create a new webview as a child of a raw window handle.
+  ///
+  /// **Note:** GTK4 does not support embedding into raw X11 window handles.
+  /// Use [`new_gtk`](Self::new_gtk) with a GTK container instead.
   pub fn new_as_child<W: HasWindowHandle>(
-    parent: &W,
-    attributes: WebViewAttributes,
-    pl_attrs: super::PlatformSpecificWebViewAttributes,
+    _parent: &W,
+    _attributes: WebViewAttributes,
+    _pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self> {
     #[cfg(feature = "x11")]
     {
-      Self::new_x11(parent, attributes, pl_attrs, true)
+      Err(Error::Gtk4X11EmbeddingUnsupported)
     }
     #[cfg(not(feature = "x11"))]
     {
-      let _ = parent;
-      let _ = attributes;
-      let _ = pl_attrs;
       Err(Error::UnsupportedWindowHandle)
     }
-  }
-
-  #[cfg(feature = "x11")]
-  fn new_x11<W: HasWindowHandle>(
-    window: &W,
-    attributes: WebViewAttributes,
-    pl_attrs: super::PlatformSpecificWebViewAttributes,
-    is_child: bool,
-  ) -> Result<Self> {
-    let parent = match window.window_handle()?.as_raw() {
-      RawWindowHandle::Xlib(w) => w.window,
-      _ => return Err(Error::UnsupportedWindowHandle),
-    };
-
-    let xlib = Xlib::open()?;
-
-    let gdk_display = gdk::Display::default().ok_or(crate::Error::X11DisplayNotFound)?;
-    let gx11_display: &X11Display = gdk_display.downcast_ref().unwrap();
-    let raw = gx11_display.as_ptr();
-
-    let x11_display = unsafe { gdkx11::ffi::gdk_x11_display_get_xdisplay(raw) };
-
-    let x11_window = match is_child {
-      true => Self::create_container_x11_window(&xlib, x11_display as _, parent, &attributes),
-      false => parent,
-    };
-
-    let (gtk_window, vbox) = Self::create_gtk_window(raw, x11_window);
-
-    let visible = attributes.visible;
-
-    Self::new_gtk(&vbox, attributes, pl_attrs).map(|mut w| {
-      // for some reason, if the webview starts as hidden,
-      // we will need about 3 calls to `webview.set_visible`
-      // with alternating value.
-      // calling gtk_window.show_all() then hiding it again
-      // seems to fix the issue.
-      gtk_window.show_all();
-      if !visible {
-        let _ = w.set_visible(false);
-      }
-
-      w.x11.replace(X11Data {
-        is_child,
-        xlib,
-        x11_display: x11_display as _,
-        x11_window,
-        gtk_window,
-      });
-
-      w
-    })
-  }
-
-  #[cfg(feature = "x11")]
-  fn create_container_x11_window(
-    xlib: &Xlib,
-    display: *mut _XDisplay,
-    parent: c_ulong,
-    attributes: &WebViewAttributes,
-  ) -> c_ulong {
-    let scale_factor = scale_factor_from_x11(xlib, display, parent);
-    let (x, y) = attributes
-      .bounds
-      .map(|b| b.position.to_physical::<f64>(scale_factor))
-      .map(Into::into)
-      .unwrap_or((0, 0));
-    let (width, height) = attributes
-      .bounds
-      .map(|b| b.size.to_physical::<u32>(scale_factor))
-      .map(Into::into)
-      // it is unlikey that bounds are not set because
-      // we have a default for it, but anyways we need to have a fallback
-      // and we need to use 1 not 0 here otherwise xlib will crash
-      .unwrap_or((1, 1));
-
-    let window =
-      unsafe { (xlib.XCreateSimpleWindow)(display, parent, x, y, width, height, 0, 0, 0) };
-
-    if attributes.visible {
-      unsafe { (xlib.XMapWindow)(display, window) };
-    }
-
-    window
-  }
-
-  #[cfg(feature = "x11")]
-  pub fn create_gtk_window(
-    raw: *mut GdkX11Display,
-    x11_window: c_ulong,
-  ) -> (gtk::Window, gtk::Box) {
-    // Gdk.Window
-    let gdk_window = unsafe { gdk_x11_window_foreign_new_for_display(raw, x11_window) };
-    let gdk_window = unsafe { gdk::Window::from_glib_full(gdk_window) };
-
-    // Gtk.Window
-    let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.connect_realize(glib::clone!(@weak gdk_window as wd => move |w| w.set_window(wd)));
-    window.set_has_window(true);
-    window.realize();
-
-    // Gtk.Box (vertical)
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    window.add(&vbox);
-
-    (window, vbox)
   }
 
   pub fn new_gtk<W>(
@@ -248,7 +154,7 @@ impl InnerWebView {
     pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self>
   where
-    W: IsA<gtk::Container>,
+    W: IsA<gtk4::Widget>,
   {
     // default_context allows us to create a scoped context on-demand
     let mut default_context;
@@ -271,11 +177,11 @@ impl InnerWebView {
           format!("socks5://{}:{}", endpoint.host, endpoint.port)
         }
       };
-      if let Some(website_data_manager) = web_context.context().website_data_manager() {
-        let mut settings = NetworkProxySettings::new(Some(proxy_uri.as_str()), &[]);
-        website_data_manager
-          .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut settings));
-      }
+      // webkit6: Proxy settings moved from WebsiteDataManager to NetworkSession
+      let settings = NetworkProxySettings::new(Some(proxy_uri.as_str()), &[]);
+      web_context
+        .network_session()
+        .set_proxy_settings(NetworkProxyMode::Custom, Some(&settings));
     }
 
     // Extension loading
@@ -287,11 +193,11 @@ impl InnerWebView {
 
     // Transparent
     if attributes.transparent {
-      webview.set_background_color(&gtk::gdk::RGBA::new(0., 0., 0., 0.));
+      webview.set_background_color(&gdk::RGBA::new(0., 0., 0., 0.));
     } else {
       // background color
       if let Some((red, green, blue, alpha)) = attributes.background_color {
-        webview.set_background_color(&gtk::gdk::RGBA::new(
+        webview.set_background_color(&gdk::RGBA::new(
           red as _, green as _, blue as _, alpha as _,
         ));
       }
@@ -328,11 +234,7 @@ impl InnerWebView {
       id,
       webview,
       pending_scripts: Arc::new(Mutex::new(Some(Vec::new()))),
-
       is_in_fixed_parent,
-      #[cfg(feature = "x11")]
-      x11: None,
-
       #[cfg(any(debug_assertions, feature = "devtools"))]
       is_inspector_open,
     };
@@ -353,7 +255,8 @@ impl InnerWebView {
         if let Some(pending_scripts) = pending_scripts_.take() {
           let cancellable: Option<&Cancellable> = None;
           for script in pending_scripts {
-            webview.run_javascript(&script, cancellable, |_| ());
+            // webkit6: evaluate_javascript replaces run_javascript
+            webview.evaluate_javascript(&script, None, None, cancellable, |_| ());
           }
         }
       }
@@ -372,7 +275,7 @@ impl InnerWebView {
     }
 
     if attributes.visible {
-      w.webview.show_all();
+      w.webview.set_visible(true);
     }
 
     if attributes.focused {
@@ -414,10 +317,8 @@ impl InnerWebView {
       input_context.set_enable_preedit(false);
     }
 
-    // use system scrollbars
-    if let Some(context) = webview.context() {
-      context.set_use_system_appearance_for_scrollbars(false);
-    }
+    // Note: set_use_system_appearance_for_scrollbars was removed in webkit6
+    // GTK4 handles scrollbar theming automatically
 
     if let Some(settings) = WebViewExt::settings(webview) {
       // Enable webgl, webaudio, canvas features as default.
@@ -454,7 +355,10 @@ impl InnerWebView {
     attributes: &mut WebViewAttributes,
   ) {
     // window.close()
-    webview.connect_close(move |webview| unsafe { webview.destroy() });
+    // GTK4: Use try_close() instead of destroy()
+    webview.connect_close(move |webview| {
+      webview.try_close();
+    });
 
     // Synthetic mouse events
     synthetic_mouse_events::setup(webview);
@@ -483,11 +387,17 @@ impl InnerWebView {
     // window creation handler
     if let Some(new_window_req_handler) = attributes.new_window_req_handler.take() {
       let related_webviews = Rc::new(Mutex::new(HashMap::new()));
-      webview.connect_create(move |webview, action| {
-        let url = action
+      // Use our custom signal connection that properly supports returning NULL
+      // to deny popup creation. The webkit6-rs bindings don't support this.
+      connect_create_with_nullable_return(webview, move |webview, action| {
+        let url = match action
           .request()
           .and_then(|request| request.uri())
-          .map(|uri| uri.as_str().to_string())?;
+          .map(|uri| uri.as_str().to_string())
+        {
+          Some(url) => url,
+          None => return None,
+        };
         match new_window_req_handler(
           url.clone(),
           NewWindowFeatures {
@@ -500,25 +410,25 @@ impl InnerWebView {
         ) {
           NewWindowResponse::Allow => {
             let related_webviews = related_webviews.clone();
-            let toplevel = webview.toplevel().unwrap();
-            let window = toplevel.downcast::<gtk::ApplicationWindow>().unwrap();
+            let root = webview.root().unwrap();
+            let window = root.dynamic_cast_ref::<gtk4::ApplicationWindow>().unwrap();
             let id = window.id();
             let app = window.application().unwrap();
 
-            let window = gtk::ApplicationWindow::builder()
+            let window = gtk4::ApplicationWindow::builder()
               .application(&app)
               .title(&url)
               .build();
-            let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            window.add(&box_);
+            let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            window.set_child(Some(&box_));
 
             let related_webviews_ = related_webviews.clone();
             window.connect_destroy(move |_| {
               related_webviews_.lock().unwrap().remove(&id);
             });
 
-            window.show_all();
-            Self::new_gtk(
+            window.set_visible(true);
+            match Self::new_gtk(
               &box_,
               WebViewAttributes {
                 ..Default::default()
@@ -527,15 +437,16 @@ impl InnerWebView {
                 related_view: Some(webview.clone()),
                 ..Default::default()
               },
-            )
-            .map(|webview| {
-              let widget = webview.webview.upcast_ref::<gtk::Widget>().clone();
-              related_webviews.lock().unwrap().insert(id, webview);
-              widget
-            })
-            .ok()
+            ) {
+              Ok(webview) => {
+                let widget = webview.webview.upcast_ref::<gtk4::Widget>().clone();
+                related_webviews.lock().unwrap().insert(id, webview);
+                Some(widget)
+              }
+              Err(_) => None,
+            }
           }
-          NewWindowResponse::Create { webview } => Some(webview.upcast::<gtk::Widget>()),
+          NewWindowResponse::Create { webview } => Some(webview.upcast::<gtk4::Widget>()),
           NewWindowResponse::Deny => None,
         }
       });
@@ -550,7 +461,8 @@ impl InnerWebView {
         };
 
         if let Some(policy) = policy_decision.dynamic_cast_ref::<NavigationPolicyDecision>() {
-          if let Some(nav_action) = policy.navigation_action() {
+          // webkit6: navigation_action() and request() require &mut self
+          if let Some(mut nav_action) = policy.navigation_action() {
             if let Some(uri_req) = nav_action.request() {
               if let Some(uri) = uri_req.uri() {
                 let allow = handler(uri.to_string());
@@ -586,16 +498,20 @@ impl InnerWebView {
 
   fn add_to_container<W>(webview: &WebView, container: &W, attributes: &WebViewAttributes) -> bool
   where
-    W: IsA<gtk::Container>,
+    W: IsA<gtk4::Widget>,
   {
     let mut is_in_fixed_parent = false;
 
     let container_type = container.type_().name();
     if container_type == "GtkBox" {
+      // GTK4: use append() instead of pack_start()
       container
-        .dynamic_cast_ref::<gtk::Box>()
+        .dynamic_cast_ref::<gtk4::Box>()
         .unwrap()
-        .pack_start(webview, true, true, 0);
+        .append(webview);
+      // For expansion, set the widget properties
+      webview.set_hexpand(true);
+      webview.set_vexpand(true);
     } else if container_type == "GtkFixed" {
       let scale_factor = webview.scale_factor() as f64;
       let (width, height) = attributes
@@ -605,20 +521,32 @@ impl InnerWebView {
         .unwrap_or((1, 1));
       let (x, y) = attributes
         .bounds
-        .map(|b| b.position.to_logical::<i32>(scale_factor))
+        .map(|b| b.position.to_logical::<f64>(scale_factor))
         .map(Into::into)
-        .unwrap_or((0, 0));
+        .unwrap_or((0.0, 0.0));
 
       webview.set_size_request(width, height);
 
       container
-        .dynamic_cast_ref::<gtk::Fixed>()
+        .dynamic_cast_ref::<gtk4::Fixed>()
         .unwrap()
         .put(webview, x, y);
 
       is_in_fixed_parent = true;
+    } else if container_type == "GtkOverlay" {
+      container
+        .dynamic_cast_ref::<gtk4::Overlay>()
+        .unwrap()
+        .set_child(Some(webview));
     } else {
-      container.add(webview);
+      // For other widget types, try to set as child if it supports it
+      // In GTK4, different widgets have different child management APIs
+      if let Some(window) = container.dynamic_cast_ref::<gtk4::Window>() {
+        window.set_child(Some(webview));
+      } else {
+        // Last resort: try setting parent directly
+        webview.set_parent(container);
+      }
     }
 
     is_in_fixed_parent
@@ -632,24 +560,24 @@ impl InnerWebView {
       .expect("WebView does not have UserContentManager");
 
     // Connect before registering as recommended by the docs
-    manager.connect_script_message_received(None, move |_m, msg| {
+    // webkit6: the signal provides &javascriptcore::Value directly, not a wrapper
+    manager.connect_script_message_received(None, move |_m, js_value| {
       #[cfg(feature = "tracing")]
       let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
 
-      if let Some(js) = msg.js_value() {
-        if let Some(ipc_handler) = &ipc_handler {
-          ipc_handler(
-            Request::builder()
-              .uri(webview.uri().unwrap().to_string())
-              .body(js.to_string())
-              .unwrap(),
-          );
-        }
+      if let Some(ipc_handler) = &ipc_handler {
+        ipc_handler(
+          Request::builder()
+            .uri(webview.uri().unwrap().to_string())
+            .body(js_value.to_string().to_string())
+            .unwrap(),
+        );
       }
     });
 
     // Register the handler we just connected
-    manager.register_script_message_handler("ipc");
+    // webkit6: register_script_message_handler takes (name, world_name)
+    manager.register_script_message_handler("ipc", None);
   }
 
   #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -674,8 +602,8 @@ impl InnerWebView {
   }
 
   pub fn print(&self) -> Result<()> {
-    let print = webkit2gtk::PrintOperation::new(&self.webview);
-    print.run_dialog(None::<&gtk::Window>);
+    let print = webkit6::PrintOperation::new(&self.webview);
+    print.run_dialog(None::<&gtk4::Window>);
     Ok(())
   }
 
@@ -696,16 +624,18 @@ impl InnerWebView {
       #[cfg(feature = "tracing")]
       let span = SendEnteredSpan(tracing::debug_span!("wry::eval").entered());
 
-      self.webview.run_javascript(js, cancellable, |result| {
+      // webkit6: evaluate_javascript replaces run_javascript
+      // Result is now Result<javascriptcore6::Value, glib::Error>
+      self.webview.evaluate_javascript(js, None, None, cancellable, |result| {
         #[cfg(feature = "tracing")]
         drop(span);
 
         if let Some(callback) = callback {
           let result = result
-            .map(|r| r.js_value().and_then(|js| js.to_json(0)))
-            .unwrap_or_default()
-            .unwrap_or_default()
-            .to_string();
+            .ok()
+            .and_then(|value| value.to_json(0))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
 
           callback(result);
         }
@@ -762,7 +692,7 @@ impl InnerWebView {
   }
 
   pub fn set_background_color(&self, (red, green, blue, alpha): RGBA) -> Result<()> {
-    self.webview.set_background_color(&gtk::gdk::RGBA::new(
+    self.webview.set_background_color(&gdk::RGBA::new(
       red as _, green as _, blue as _, alpha as _,
     ));
     Ok(())
@@ -774,9 +704,10 @@ impl InnerWebView {
   }
 
   pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) -> Result<()> {
-    let req = URIRequest::builder().uri(url).build();
+    // webkit6: Use URIRequest::new() instead of builder pattern
+    let req = URIRequest::new(url);
 
-    if let Some(ref mut req_headers) = req.http_headers() {
+    if let Some(req_headers) = req.http_headers() {
       for (header, value) in headers.iter() {
         req_headers.append(
           header.to_string().as_str(),
@@ -801,11 +732,12 @@ impl InnerWebView {
   }
 
   pub fn clear_all_browsing_data(&self) -> Result<()> {
-    if let Some(context) = self.webview.context() {
-      if let Some(data_manger) = context.website_data_manager() {
-        data_manger.clear(
-          webkit2gtk::WebsiteDataTypes::ALL,
-          gtk::glib::TimeSpan::from_seconds(0),
+    // webkit6: WebsiteDataManager accessed through NetworkSession, not WebContext
+    if let Some(network_session) = self.webview.network_session() {
+      if let Some(data_manager) = network_session.website_data_manager() {
+        data_manager.clear(
+          webkit6::WebsiteDataTypes::ALL,
+          glib::TimeSpan::from_seconds(0),
           None::<&Cancellable>,
           |_| {},
         );
@@ -818,95 +750,35 @@ impl InnerWebView {
   pub fn bounds(&self) -> Result<Rect> {
     let mut bounds = Rect::default();
 
-    #[cfg(feature = "x11")]
-    if let Some(x11_data) = &self.x11 {
-      unsafe {
-        let attributes: XWindowAttributes = std::mem::zeroed();
-        let mut attributes = std::mem::MaybeUninit::new(attributes).assume_init();
-
-        let ok = (x11_data.xlib.XGetWindowAttributes)(
-          x11_data.x11_display as _,
-          x11_data.x11_window,
-          &mut attributes,
-        );
-
-        if ok != 0 {
-          bounds.position = LogicalPosition::new(attributes.x, attributes.y).into();
-          bounds.size = LogicalSize::new(attributes.width, attributes.height).into();
-        }
-      }
-      return Ok(bounds);
-    }
-
-    let (size, _) = self.webview.allocated_size();
-    bounds.size = LogicalSize::new(size.width(), size.height()).into();
+    // GTK4: Use width() and height() instead of allocated_size()
+    let width = self.webview.width();
+    let height = self.webview.height();
+    bounds.size = LogicalSize::new(width, height).into();
 
     Ok(bounds)
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     let scale_factor = self.webview.scale_factor() as f64;
-    let (width, height) = bounds.size.to_logical::<i32>(scale_factor).into();
-    let (x, y) = bounds.position.to_logical::<i32>(scale_factor).into();
-
-    #[cfg(feature = "x11")]
-    if let Some(x11_data) = &self.x11 {
-      let window = &x11_data.gtk_window;
-      window.move_(x, y);
-      if let Some(window) = window.window() {
-        window.resize(width, height);
-      }
-      window.size_allocate(&gtk::Allocation::new(0, 0, width, height));
-    }
+    let (width, height): (i32, i32) = bounds.size.to_logical::<i32>(scale_factor).into();
+    let (x, y): (i32, i32) = bounds.position.to_logical::<i32>(scale_factor).into();
 
     if self.is_in_fixed_parent {
-      self
-        .webview
-        .size_allocate(&gtk::Allocation::new(x, y, width, height));
+      // GTK4: use set_size_request for sizing in Fixed containers
+      self.webview.set_size_request(width, height);
+      // Move the widget in the Fixed parent
+      if let Some(parent) = self.webview.parent() {
+        if let Some(fixed) = parent.dynamic_cast_ref::<gtk4::Fixed>() {
+          fixed.move_(&self.webview, x as f64, y as f64);
+        }
+      }
     }
 
     Ok(())
   }
 
-  #[cfg(feature = "x11")]
-  fn set_visible_x11(&self, visible: bool) {
-    if let Some(x11_data) = &self.x11 {
-      if x11_data.is_child {
-        if visible {
-          unsafe { (x11_data.xlib.XMapWindow)(x11_data.x11_display as _, x11_data.x11_window) };
-        } else {
-          unsafe { (x11_data.xlib.XUnmapWindow)(x11_data.x11_display as _, x11_data.x11_window) };
-        }
-      }
-    }
-  }
-
-  #[cfg(feature = "x11")]
-  fn set_visible_gtk(&self, visible: bool) {
-    if let Some(x11_data) = &self.x11 {
-      if x11_data.is_child {
-        if visible {
-          x11_data.gtk_window.show_all();
-        } else {
-          x11_data.gtk_window.hide();
-        }
-      }
-    }
-  }
-
   pub fn set_visible(&self, visible: bool) -> Result<()> {
-    #[cfg(feature = "x11")]
-    self.set_visible_x11(visible);
-
-    if visible {
-      self.webview.show_all();
-    } else {
-      self.webview.hide();
-    }
-
-    #[cfg(feature = "x11")]
-    self.set_visible_gtk(visible);
-
+    self.webview.set_visible(visible);
     Ok(())
   }
 
@@ -916,8 +788,11 @@ impl InnerWebView {
   }
 
   pub fn focus_parent(&self) -> Result<()> {
-    if let Some(window) = self.webview.parent_window() {
-      window.focus(gdk::ffi::GDK_CURRENT_TIME.try_into().unwrap_or(0));
+    // In GTK4, focus is handled differently - use the root/toplevel
+    if let Some(root) = self.webview.root() {
+      if let Some(window) = root.dynamic_cast_ref::<gtk4::Window>() {
+        window.present();
+      }
     }
 
     Ok(())
@@ -979,7 +854,7 @@ impl InnerWebView {
     );
 
     if let Some(dt) = cookie.expires_datetime() {
-      soup_cookie.set_expires(&gtk::glib::DateTime::from_unix_utc(dt.unix_timestamp()).unwrap());
+      soup_cookie.set_expires(&glib::DateTime::from_unix_utc(dt.unix_timestamp()).unwrap());
     }
 
     if let Some(http_only) = cookie.http_only() {
@@ -1003,10 +878,11 @@ impl InnerWebView {
 
   pub fn cookies_for_url(&self, url: &str) -> Result<Vec<cookie::Cookie<'static>>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // webkit6: Access through NetworkSession instead of WebView directly
     if let Some(cookies_manager) = self
       .webview
-      .website_data_manager()
-      .and_then(|manager| manager.cookie_manager())
+      .network_session()
+      .and_then(|s| s.cookie_manager())
     {
       cookies_manager.cookies(url, None::<&Cancellable>, move |cookies| {
         let cookies = cookies.map(|cookies| {
@@ -1019,8 +895,9 @@ impl InnerWebView {
       })
     }
 
+    let context = glib::MainContext::default();
     loop {
-      gtk::main_iteration();
+      context.iteration(true);
 
       if let Ok(response) = rx.try_recv() {
         return response.map_err(Into::into);
@@ -1030,10 +907,11 @@ impl InnerWebView {
 
   pub fn cookies(&self) -> Result<Vec<cookie::Cookie<'static>>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // webkit6: CookieManager accessed via network_session(), not website_data_manager()
     if let Some(cookies_manager) = self
       .webview
-      .website_data_manager()
-      .and_then(|manager| manager.cookie_manager())
+      .network_session()
+      .and_then(|session| session.cookie_manager())
     {
       cookies_manager.all_cookies(None::<&Cancellable>, move |cookies| {
         let cookies = cookies.map(|cookies| {
@@ -1046,8 +924,9 @@ impl InnerWebView {
       })
     }
 
+    let context = glib::MainContext::default();
     loop {
-      gtk::main_iteration();
+      context.iteration(true);
 
       if let Ok(response) = rx.try_recv() {
         return response.map_err(Into::into);
@@ -1057,19 +936,21 @@ impl InnerWebView {
 
   pub fn set_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // webkit6: CookieManager accessed via network_session(), not website_data_manager()
     if let Some(cookies_manager) = self
       .webview
-      .website_data_manager()
-      .and_then(|manager| manager.cookie_manager())
+      .network_session()
+      .and_then(|session| session.cookie_manager())
     {
-      let mut soup_cookie = Self::cookie_into_soup_cookie(cookie);
-      cookies_manager.add_cookie(&mut soup_cookie, None::<&Cancellable>, move |ret| {
+      let soup_cookie = Self::cookie_into_soup_cookie(cookie);
+      cookies_manager.add_cookie(&soup_cookie, None::<&Cancellable>, move |ret| {
         let _ = tx.send(ret);
       });
     }
 
+    let context = glib::MainContext::default();
     loop {
-      gtk::main_iteration();
+      context.iteration(true);
 
       if let Ok(response) = rx.try_recv() {
         return response.map_err(Into::into);
@@ -1079,19 +960,21 @@ impl InnerWebView {
 
   pub fn delete_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // webkit6: CookieManager accessed via network_session(), not website_data_manager()
     if let Some(cookies_manager) = self
       .webview
-      .website_data_manager()
-      .and_then(|manager| manager.cookie_manager())
+      .network_session()
+      .and_then(|session| session.cookie_manager())
     {
-      let mut soup_cookie = Self::cookie_into_soup_cookie(cookie);
-      cookies_manager.delete_cookie(&mut soup_cookie, None::<&Cancellable>, move |ret| {
+      let soup_cookie = Self::cookie_into_soup_cookie(cookie);
+      cookies_manager.delete_cookie(&soup_cookie, None::<&Cancellable>, move |ret| {
         let _ = tx.send(ret);
       });
     }
 
+    let context = glib::MainContext::default();
     loop {
-      gtk::main_iteration();
+      context.iteration(true);
 
       if let Ok(response) = rx.try_recv() {
         return response.map_err(Into::into);
@@ -1101,29 +984,33 @@ impl InnerWebView {
 
   pub fn reparent<W>(&self, container: &W) -> Result<()>
   where
-    W: gtk::prelude::IsA<gtk::Container>,
+    W: gtk4::prelude::IsA<gtk4::Widget>,
   {
-    if let Some(parent) = self
-      .webview
-      .parent()
-      .and_then(|p| p.dynamic_cast::<gtk::Container>().ok())
-    {
-      parent.remove(&self.webview);
+    // GTK4: First unparent from current parent
+    self.webview.unparent();
 
-      let container_type = container.type_().name();
-      if container_type == "GtkBox" {
-        container
-          .dynamic_cast_ref::<gtk::Box>()
-          .unwrap()
-          .pack_start(&self.webview, true, true, 0);
-      } else if container_type == "GtkFixed" {
-        container
-          .dynamic_cast_ref::<gtk::Fixed>()
-          .unwrap()
-          .put(&self.webview, 0, 0);
-      } else {
-        container.add(&self.webview);
-      }
+    let container_type = container.type_().name();
+    if container_type == "GtkBox" {
+      container
+        .dynamic_cast_ref::<gtk4::Box>()
+        .unwrap()
+        .append(&self.webview);
+      self.webview.set_hexpand(true);
+      self.webview.set_vexpand(true);
+    } else if container_type == "GtkFixed" {
+      container
+        .dynamic_cast_ref::<gtk4::Fixed>()
+        .unwrap()
+        .put(&self.webview, 0.0, 0.0);
+    } else if container_type == "GtkOverlay" {
+      container
+        .dynamic_cast_ref::<gtk4::Overlay>()
+        .unwrap()
+        .set_child(Some(&self.webview));
+    } else if let Some(window) = container.dynamic_cast_ref::<gtk4::Window>() {
+      window.set_child(Some(&self.webview));
+    } else {
+      self.webview.set_parent(container);
     }
 
     Ok(())
@@ -1148,96 +1035,5 @@ struct SendEnteredSpan(tracing::span::EnteredSpan);
 #[cfg(feature = "tracing")]
 unsafe impl Send for SendEnteredSpan {}
 
-#[cfg(feature = "x11")]
-fn scale_factor_from_x11(xlib: &Xlib, display: *mut _XDisplay, parent: c_ulong) -> f64 {
-  const BASE_DPI: f64 = 96.0;
-  let mut attrs = unsafe { std::mem::zeroed() };
-  unsafe { (xlib.XGetWindowAttributes)(display, parent, &mut attrs) };
-  let scale_factor = unsafe { (*attrs.screen).width as f64 * 25.4 / (*attrs.screen).mwidth as f64 };
-  scale_factor / BASE_DPI
-}
-
-mod ffi {
-  use gtk::{
-    gdk,
-    gio::{
-      self,
-      ffi::{GAsyncReadyCallback, GCancellable},
-      prelude::*,
-      Cancellable,
-    },
-    glib::{
-      self,
-      translate::{FromGlibPtrContainer, ToGlibPtr},
-    },
-  };
-  use webkit2gtk::CookieManager;
-  use webkit2gtk_sys::WebKitCookieManager;
-
-  pub trait CookieManageExt: IsA<CookieManager> + 'static {
-    fn all_cookies<P: FnOnce(std::result::Result<Vec<soup::Cookie>, glib::Error>) + 'static>(
-      &self,
-      cancellable: Option<&impl IsA<Cancellable>>,
-      callback: P,
-    ) {
-      let main_context = glib::MainContext::ref_thread_default();
-      let is_main_context_owner = main_context.is_owner();
-      let has_acquired_main_context = (!is_main_context_owner)
-        .then(|| main_context.acquire().ok())
-        .flatten();
-      assert!(
-        is_main_context_owner || has_acquired_main_context.is_some(),
-        "Async operations only allowed if the thread is owning the MainContext"
-      );
-
-      let user_data: Box<glib::thread_guard::ThreadGuard<P>> =
-        Box::new(glib::thread_guard::ThreadGuard::new(callback));
-      unsafe extern "C" fn cookies_trampoline<
-        P: FnOnce(std::result::Result<Vec<soup::Cookie>, glib::Error>) + 'static,
-      >(
-        _source_object: *mut glib::gobject_ffi::GObject,
-        res: *mut gdk::gio::ffi::GAsyncResult,
-        user_data: glib::ffi::gpointer,
-      ) {
-        let mut error = std::ptr::null_mut();
-        let ret =
-          webkit_cookie_manager_get_all_cookies_finish(_source_object as *mut _, res, &mut error);
-        let result = if error.is_null() {
-          Ok(FromGlibPtrContainer::from_glib_full(ret))
-        } else {
-          Err(glib::translate::from_glib_full(error))
-        };
-        let callback: Box<glib::thread_guard::ThreadGuard<P>> = Box::from_raw(user_data as *mut _);
-        let callback: P = callback.into_inner();
-        callback(result);
-      }
-      let callback = cookies_trampoline::<P>;
-
-      unsafe {
-        webkit_cookie_manager_get_all_cookies(
-          self.as_ref().to_glib_none().0,
-          cancellable.map(|p| p.as_ref()).to_glib_none().0,
-          Some(callback),
-          Box::into_raw(user_data) as *mut _,
-        );
-      }
-    }
-  }
-
-  impl CookieManageExt for CookieManager {}
-
-  extern "C" {
-    pub fn webkit_cookie_manager_get_all_cookies(
-      cookie_manager: *mut webkit2gtk_sys::WebKitCookieManager,
-      cancellable: *mut GCancellable,
-      callback: GAsyncReadyCallback,
-      user_data: glib::ffi::gpointer,
-    );
-
-    pub fn webkit_cookie_manager_get_all_cookies_finish(
-      cookie_manager: *mut WebKitCookieManager,
-      result: *mut gio::ffi::GAsyncResult,
-      error: *mut *mut glib::ffi::GError,
-    ) -> *mut glib::ffi::GList;
-  }
-}
+// Note: webkit6 already provides CookieManager::all_cookies() natively,
+// so the custom FFI that was here for webkit2gtk has been removed.
